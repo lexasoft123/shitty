@@ -528,6 +528,12 @@ void ApplicationImpl::updateWindowInfo(const plt::WindowInfo& info) {
 
 bool ApplicationImpl::frame(const plt::WindowInfo& info) {
     updateWindowInfo(info);
+    if (composer.sessions == nullptr) {
+        // Still starting up: entering fullscreen on macOS displays the layer,
+        // and so lands here, before the renderer and sessions exist (issue
+        // 116). The first frame after startup paints.
+        return false;
+    }
     if (composer.renderer == nullptr) {
         // The previous renderer died with its surface and dropped its own
         // pool; build a fresh one and repaint everything.
