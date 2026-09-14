@@ -75,6 +75,22 @@ signal.pause()
                 "SIGWINCH|80x5",
             )
 
+    def test_fullscreen_startup_survives_the_inline_transition_frame(self):
+        # Entering fullscreen delivers a frame from inside the request -
+        # on macOS the transition's Core Animation transaction commits
+        # inline, and the headless window mirrors that - before the
+        # renderer and the sessions exist. Startup must skip that frame
+        # instead of crashing on it (issue 116); reaching READY at all is
+        # the point, and the geometry report shows the terminal parsing
+        # and replying on the fullscreen grid afterwards.
+        with Shitty(
+            columns=10,
+            rows=4,
+            extra_arguments=("-fullscreen", "-allowWindowOps", "true"),
+        ) as terminal:
+            terminal.write(b"\x1b[18t")
+            self.assertEqual(terminal.read_input(), b"\x1b[8;1076;1916t")
+
 
 if __name__ == "__main__":
     unittest.main()
