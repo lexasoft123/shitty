@@ -1284,6 +1284,15 @@ void WindowImpl::requestResize(u32 width, u32 height) {
     // synchronous resize path would then recurse. Defer it, so the window system
     // delivers a fresh frame() with the new size instead of recursing.
     dispatch_async(dispatch_get_main_queue(), ^{
+        // A zoom or a fullscreen transition may have taken the window over
+        // while this waited: entering either is synchronous, changing the
+        // frame of a zoomed window un-zooms it, and a resize computed before
+        // the transition would tear the new state right back down (issue
+        // 118). Such a window is not ours to size; drop the stale request
+        // and let the next frame reflow the grid over the pixels it has.
+        if ((target.styleMask & NSWindowStyleMaskFullScreen) != 0 || [target isZoomed]) {
+            return;
+        }
         [target setContentSize:size];
     });
 }
