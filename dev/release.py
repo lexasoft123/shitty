@@ -198,6 +198,36 @@ def create_binary_archive(
     write_tar(output, timestamp, write_contents)
 
 
+def create_directory_archive(
+    root: Path,
+    output: Path,
+    timestamp: int,
+) -> None:
+    entries = sorted(root.rglob("*"))
+
+    def write_contents(archive: tarfile.TarFile) -> None:
+        top = tarfile.TarInfo(f"{root.name}/")
+        top.type = tarfile.DIRTYPE
+        top.mode = 0o755
+        top.uid = 0
+        top.gid = 0
+        top.mtime = timestamp
+        archive.addfile(top)
+        for source in entries:
+            if source.is_symlink():
+                raise RuntimeError(f"unsupported symlink in bundle: {source}")
+            relative = source.relative_to(root.parent)
+            name = f"{relative.as_posix()}/" if source.is_dir() else relative.as_posix()
+            info = tar_info(archive, source, name, timestamp)
+            if info.isreg():
+                with source.open("rb") as input_file:
+                    archive.addfile(info, input_file)
+            else:
+                archive.addfile(info)
+
+    write_tar(output, timestamp, write_contents)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Assemble and publish a Shitty GitHub release.",
@@ -286,6 +316,44 @@ def main() -> int:
             raise RuntimeError(
                 f"unexpected {platform} {binary_name} artifact: {file_description}"
             )
+
+    # macOS .app bundles, wrapping the same darwin-arm64 binaries validated
+    # above. Additive to binary_inputs, not a replacement: the loose st/pt
+    # archives keep feeding the Homebrew tap (a separate repository this
+    # script cannot update), while these give a direct, double-clickable
+    # download. See dev/package_macos_app.sh, which builds this layout.
+    bundle_inputs = (
+        (
+            "Shitty",
+            "darwin-arm64",
+            arguments.darwin_binaries_directory.resolve() / "Shitty.app",
+            "st",
+            ("Mach-O 64-bit", "arm64", "executable"),
+        ),
+        (
+            "Pretty",
+            "darwin-arm64",
+            arguments.darwin_binaries_directory.resolve() / "Pretty.app",
+            "pt",
+            ("Mach-O 64-bit", "arm64", "executable"),
+        ),
+    )
+    for bundle_name, platform, bundle, executable_name, markers in bundle_inputs:
+        if not bundle.is_dir():
+            raise RuntimeError(
+                f"prebuilt {platform} {bundle_name}.app bundle does not exist: {bundle}"
+            )
+        if not (bundle / "Contents" / "Info.plist").is_file():
+            raise RuntimeError(f"{bundle}: missing Contents/Info.plist")
+        executable = bundle / "Contents" / "MacOS" / executable_name
+        if not executable.is_file():
+            raise RuntimeError(f"{bundle}: missing Contents/MacOS/{executable_name}")
+        file_description = run(["file", os.fspath(executable)], capture=True)
+        if not all(marker in file_description for marker in markers):
+            raise RuntimeError(
+                f"unexpected {platform} {bundle_name}.app artifact: {file_description}"
+            )
+
     extra_artifacts = []
     for artifact in arguments.extra_artifact:
         artifact = artifact.resolve()
@@ -351,10 +419,19 @@ def main() -> int:
             )
             for binary_name, platform, binary, _ in binary_inputs
         ]
+        bundle_archives = [
+            (
+                bundle_name,
+                bundle,
+                artifacts / f"{bundle_name}-{platform}.tar.gz",
+            )
+            for bundle_name, platform, bundle, _, _ in bundle_inputs
+        ]
         notes_file = artifacts / "release-notes.md"
         generated_names = {
             source_archive.name,
             *(archive.name for _, _, archive in binary_archives),
+            *(archive.name for _, _, archive in bundle_archives),
         }
         if generated_names & {artifact.name for artifact in extra_artifacts}:
             raise RuntimeError("an extra artifact collides with a generated artifact")
@@ -369,6 +446,8 @@ def main() -> int:
         )
         for binary_name, binary, binary_archive in binary_archives:
             create_binary_archive(binary, binary_name, binary_archive, timestamp)
+        for bundle_name, bundle, bundle_archive in bundle_archives:
+            create_directory_archive(bundle, bundle_archive, timestamp)
 
         refs = remote_refs(remote, arguments.tag)
         branch_exists, tag_exists = verify_remote_refs(
@@ -405,6 +484,7 @@ def main() -> int:
                 arguments.tag,
                 os.fspath(source_archive),
                 *(os.fspath(archive) for _, _, archive in binary_archives),
+                *(os.fspath(archive) for _, _, archive in bundle_archives),
                 *(os.fspath(artifact) for artifact in extra_artifacts),
                 "--repo",
                 repository,

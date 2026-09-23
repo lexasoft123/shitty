@@ -239,11 +239,32 @@ jobs:
           mkdir -p "$RUNNER_TEMP/darwin-arm64"
           cp -L .build-darwin/st .build-darwin/pt "$RUNNER_TEMP/darwin-arm64/"
 
+      # Wraps the same two binaries staged above in a proper .app bundle
+      # (Info.plist, a generated .icns) for direct, double-clickable
+      # distribution. The loose st/pt staged above are untouched and keep
+      # feeding the Homebrew tap exactly as before — this is additive, not a
+      # replacement, because the tap's formula lives in a separate repo
+      # (pg83/homebrew-tap) this workflow cannot update in lockstep.
+      - name: Package Darwin app bundles
+        run: |
+          dev/package_macos_app.sh \
+            "Shitty" com.pg83.shitty st bin/st/shitty.svg \
+            "$RUNNER_TEMP/darwin-arm64/st" \
+            "$RUNNER_TEMP/darwin-arm64/Shitty.app"
+          dev/package_macos_app.sh \
+            "Pretty" com.pg83.pretty pt bin/pt/pretty.svg \
+            "$RUNNER_TEMP/darwin-arm64/pt" \
+            "$RUNNER_TEMP/darwin-arm64/Pretty.app"
+
       - name: Upload Darwin artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: darwin-arm64
-          path: ${{ runner.temp }}/darwin-arm64/*
+          path: |
+            ${{ runner.temp }}/darwin-arm64/st
+            ${{ runner.temp }}/darwin-arm64/pt
+            ${{ runner.temp }}/darwin-arm64/Shitty.app
+            ${{ runner.temp }}/darwin-arm64/Pretty.app
           if-no-files-found: error
           retention-days: 1
           compression-level: 0
@@ -277,6 +298,28 @@ jobs:
           "$RUNNER_TEMP/darwin-arm64/st" -version | grep -q '^Shitty '
           "$RUNNER_TEMP/darwin-arm64/pt" -version | grep -q '^Pretty '
 
+      # Catches a packaging bug (a malformed plist, a missing icon, the
+      # wrong binary copied in) before Sign and Notarize spend Apple API
+      # quota and several minutes signing and notarizing it.
+      - name: Verify Darwin app bundles
+        run: |
+          for spec in "Shitty.app:st:Shitty:shitty" "Pretty.app:pt:Pretty:pretty"; do
+            app=$(echo "$spec" | cut -d: -f1)
+            executable=$(echo "$spec" | cut -d: -f2)
+            display_name=$(echo "$spec" | cut -d: -f3)
+            icon_name=$(echo "$spec" | cut -d: -f4)
+            bundle="$RUNNER_TEMP/darwin-arm64/$app"
+
+            plutil -lint "$bundle/Contents/Info.plist"
+            test -f "$bundle/Contents/Resources/$icon_name.icns"
+
+            chmod +x "$bundle/Contents/MacOS/$executable"
+            path="$bundle/Contents/MacOS/$executable"
+            file "$path"
+            file "$path" | grep -q 'Mach-O 64-bit executable arm64'
+            "$path" -version | grep -q "^$display_name "
+          done
+
       - name: Test Metal through Cocoa
         run: |
           python3 - "$RUNNER_TEMP/darwin-arm64/st" <<'PY'
@@ -295,6 +338,185 @@ jobs:
           )
           PY
 
+  # Runs after test-darwin, deliberately: signing and notarizing costs Apple
+  # API quota and several minutes, and there is no reason to spend either on
+  # a build that already failed the Metal/Cocoa smoke test.
+  #
+  # Every step below degrades to what this repo has always shipped — the
+  # linker's ad-hoc signature, unsigned by any Developer ID, unnotarized —
+  # when the secrets it reads are absent, rather than failing the release.
+  # That is not hypothetical here: a fork gets none of this repo's secrets,
+  # and a secret can be rotated away. See dev/docs/macos_signing.md for what
+  # each secret is and why.
+  sign-notarize-darwin:
+    name: Sign and notarize Darwin artifacts
+    needs:
+      - build-darwin
+      - test-darwin
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Download Darwin artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: darwin-arm64
+          path: ${{ runner.temp }}/darwin-arm64
+
+      # Signs the .app BUNDLES, not the loose binaries directly — codesign
+      # on a bundle path signs the bundle container and the executable
+      # inside it together, which is what notarization and Gatekeeper both
+      # expect to see. The loose st/pt staged for Homebrew are then
+      # overwritten with a copy of that now-signed executable, so both
+      # distribution shapes carry the exact same Developer ID signature from
+      # one signing pass rather than two.
+      - name: Sign Darwin app bundles
+        run: |
+          chmod +x "$RUNNER_TEMP/darwin-arm64/st" "$RUNNER_TEMP/darwin-arm64/pt" \
+            "$RUNNER_TEMP/darwin-arm64/Shitty.app/Contents/MacOS/st" \
+            "$RUNNER_TEMP/darwin-arm64/Pretty.app/Contents/MacOS/pt"
+
+          if [ -z "$APPLE_DEVELOPER_ID_CERTIFICATE_BASE64" ]; then
+            echo "::warning::No APPLE_DEVELOPER_ID_CERTIFICATE_BASE64 — shipping"\
+                 "the linker's ad-hoc signature, unnotarized, same as every"\
+                 "release before this pipeline existed."
+            exit 0
+          fi
+
+          kc="$RUNNER_TEMP/shitty-signing.keychain-db"
+          # Not the .p12 password: this one is ours, lives for the job, and
+          # is what set-key-partition-list actually wants (see
+          # dev/docs/macos_signing.md for the bug this avoids).
+          kcpw=$(openssl rand -base64 24)
+          (umask 077; printf '%s' "$APPLE_DEVELOPER_ID_CERTIFICATE_BASE64" \
+              | base64 -d > "$RUNNER_TEMP/cert.p12")
+          trap 'rm -f "$RUNNER_TEMP/cert.p12"' EXIT
+
+          security create-keychain -p "$kcpw" "$kc"
+          security set-keychain-settings "$kc"
+          security unlock-keychain -p "$kcpw" "$kc"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -T /usr/bin/codesign \
+            -P "$APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kcpw" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          # Anchored on the certificate type, not just on any quoted
+          # identity, so a wrong-secret Apple Development/Distribution .p12
+          # (the easy mistake — the iOS pipeline deals in exactly those)
+          # fails loudly here instead of silently producing an unnotarizable
+          # signature.
+          name=$(security find-identity -v -p codesigning "$kc" \
+            | sed -n 's/.*"\(Developer ID Application: .*\)".*/\1/p' | head -1)
+          if [ -z "$name" ]; then
+            echo "::error::Certificate imported but no Developer ID Application"\
+                 "codesigning identity found — is"\
+                 "APPLE_DEVELOPER_ID_CERTIFICATE_BASE64 the right .p12?"
+            exit 1
+          fi
+
+          for app in Shitty.app Pretty.app; do
+            codesign --force --options runtime --timestamp --sign "$name" \
+              "$RUNNER_TEMP/darwin-arm64/$app"
+            codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/darwin-arm64/$app"
+          done
+
+          cp -f "$RUNNER_TEMP/darwin-arm64/Shitty.app/Contents/MacOS/st" "$RUNNER_TEMP/darwin-arm64/st"
+          cp -f "$RUNNER_TEMP/darwin-arm64/Pretty.app/Contents/MacOS/pt" "$RUNNER_TEMP/darwin-arm64/pt"
+
+          echo "SHITTY_SIGNED=1" >> "$GITHUB_ENV"
+        env:
+          APPLE_DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_BASE64 }}
+          APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+
+      # Only reached when Sign actually signed something — notarizing an
+      # ad-hoc signature is refused by Apple anyway, so there is nothing
+      # useful to submit without a Developer ID identity first.
+      - name: Notarize and staple Darwin app bundles
+        if: env.SHITTY_SIGNED == '1'
+        run: |
+          if [ -z "$APP_STORE_CONNECT_API_KEY_BASE64" ] || \
+             [ -z "$APP_STORE_CONNECT_API_KEY_ID" ] || \
+             [ -z "$APP_STORE_CONNECT_API_ISSUER_ID" ]; then
+            echo "::warning::No App Store Connect API key secrets — shipping"\
+                 "Developer ID signed but unnotarized bundles."
+            exit 0
+          fi
+
+          # A filesystem PATH to the .p8, not the key's contents — notarytool
+          # wants the file itself. RUNNER_TEMP dies with the job.
+          printf '%s' "$APP_STORE_CONNECT_API_KEY_BASE64" | base64 -d > "$RUNNER_TEMP/AuthKey.p8"
+          chmod 600 "$RUNNER_TEMP/AuthKey.p8"
+          trap 'rm -f "$RUNNER_TEMP/AuthKey.p8"' EXIT
+
+          # ditto, not zip: it preserves the extended attributes and resource
+          # forks notarytool expects from a bundle, which a plain zip does
+          # not guarantee. Both apps go in one submission — one API round
+          # trip, one ticket lookup, and notarytool inspects every signed
+          # bundle it finds inside.
+          ditto -c -k --keepParent \
+            "$RUNNER_TEMP/darwin-arm64/Shitty.app" "$RUNNER_TEMP/darwin-arm64/Pretty.app" \
+            "$RUNNER_TEMP/darwin-submit.zip"
+
+          xcrun notarytool submit "$RUNNER_TEMP/darwin-submit.zip" \
+            --key "$RUNNER_TEMP/AuthKey.p8" \
+            --key-id "$APP_STORE_CONNECT_API_KEY_ID" \
+            --issuer "$APP_STORE_CONNECT_API_ISSUER_ID" \
+            --wait --timeout 20m \
+            --output-format json | tee "$RUNNER_TEMP/notarize.json"
+
+          id=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['id'])" "$RUNNER_TEMP/notarize.json")
+          status=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['status'])" "$RUNNER_TEMP/notarize.json")
+          echo "notarization $id: $status"
+          if [ "$status" != "Accepted" ]; then
+            xcrun notarytool log "$id" \
+              --key "$RUNNER_TEMP/AuthKey.p8" \
+              --key-id "$APP_STORE_CONNECT_API_KEY_ID" \
+              --issuer "$APP_STORE_CONNECT_API_ISSUER_ID"
+            echo "::error::notarization did not succeed: $status"
+            exit 1
+          fi
+
+          # Only a bundle can carry a stapled ticket — stapler has no form
+          # for a loose Mach-O executable, which is why the st/pt copies
+          # made in the Sign step stay staple-free. Gatekeeper still accepts
+          # them offline-first the way it accepts any notarized bundle:
+          # the staple, when present, just skips its online ticket lookup.
+          for app in Shitty.app Pretty.app; do
+            xcrun stapler staple "$RUNNER_TEMP/darwin-arm64/$app"
+            xcrun stapler validate "$RUNNER_TEMP/darwin-arm64/$app"
+          done
+        env:
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+
+      # Informational, not a gate: spctl's online ticket lookup can be flaky
+      # from a CI runner, and a false negative here should not fail a release
+      # notarytool already accepted.
+      - name: Verify Gatekeeper acceptance
+        if: env.SHITTY_SIGNED == '1'
+        run: |
+          for binary in st pt; do
+            codesign -dv --verbose=4 "$RUNNER_TEMP/darwin-arm64/$binary"
+          done
+          for app in Shitty.app Pretty.app; do
+            codesign -dv --verbose=4 "$RUNNER_TEMP/darwin-arm64/$app"
+            spctl -a -vv -t execute "$RUNNER_TEMP/darwin-arm64/$app" || true
+          done
+
+      - name: Upload signed Darwin artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: darwin-arm64-signed
+          path: |
+            ${{ runner.temp }}/darwin-arm64/st
+            ${{ runner.temp }}/darwin-arm64/pt
+            ${{ runner.temp }}/darwin-arm64/Shitty.app
+            ${{ runner.temp }}/darwin-arm64/Pretty.app
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
   package-release:
     name: Package and publish release
     needs:
@@ -304,6 +526,7 @@ jobs:
       - test-linux-ubuntu
       - build-darwin
       - test-darwin
+      - sign-notarize-darwin
     runs-on: ubuntu-26.04
     steps:
       - name: Check out source
@@ -320,7 +543,7 @@ jobs:
       - name: Download Darwin artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: darwin-arm64
+          name: darwin-arm64-signed
           path: ${{ runner.temp }}/release-input/darwin-arm64
 
       - name: Let the release push tags
