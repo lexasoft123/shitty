@@ -219,6 +219,16 @@ def create_directory_archive(
             relative = source.relative_to(root.parent)
             name = f"{relative.as_posix()}/" if source.is_dir() else relative.as_posix()
             info = tar_info(archive, source, name, timestamp)
+            # The bundle reaches this script through actions/download-artifact,
+            # which drops file modes: trusting the source would ship an .app
+            # whose executable is not executable. The archive is meant to be
+            # deterministic anyway, so every mode comes from structure alone -
+            # directories and the executables under Contents/MacOS are 755,
+            # every other file 644.
+            if source.is_dir() or source.parent.name == "MacOS":
+                info.mode = 0o755
+            else:
+                info.mode = 0o644
             if info.isreg():
                 with source.open("rb") as input_file:
                     archive.addfile(info, input_file)
