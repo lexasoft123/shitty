@@ -453,8 +453,17 @@ jobs:
           # not guarantee. Both apps go in one submission — one API round
           # trip, one ticket lookup, and notarytool inspects every signed
           # bundle it finds inside.
+          #
+          # `ditto -c` takes exactly ONE source ("Can't archive multiple
+          # sources" otherwise, measured here) — --keepParent does not turn
+          # it into a multi-source flag the way cp's semantics might
+          # suggest. So this stages both apps under one directory first and
+          # archives that.
+          mkdir -p "$RUNNER_TEMP/darwin-submit"
+          cp -R "$RUNNER_TEMP/darwin-arm64/Shitty.app" "$RUNNER_TEMP/darwin-arm64/Pretty.app" \
+            "$RUNNER_TEMP/darwin-submit/"
           ditto -c -k --keepParent \
-            "$RUNNER_TEMP/darwin-arm64/Shitty.app" "$RUNNER_TEMP/darwin-arm64/Pretty.app" \
+            "$RUNNER_TEMP/darwin-submit" \
             "$RUNNER_TEMP/darwin-submit.zip"
 
           xcrun notarytool submit "$RUNNER_TEMP/darwin-submit.zip" \
